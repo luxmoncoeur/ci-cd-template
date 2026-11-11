@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1](https://github.com/luxmoncoeur/ci-cd-template/compare/v1.0.0...v1.0.1) (2026-11-11)
+
+### Bug Fixes
+
+* strip terminal colors from the PR title error comment ([33a46c4](https://github.com/luxmoncoeur/ci-cd-template/commit/33a46c4d979624e3b76e29fd2f8a86d2cb4fab48))
+
 ## 1.0.0 (2026-11-11)
 
 ### Features
