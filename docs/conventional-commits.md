@@ -1,7 +1,8 @@
 # Conventional Commits cheat sheet
 
 Releases are fully automated: the commit messages on `main` decide the next version. With squash merges
-(the recommended setup), **the PR title is the commit message**, so the PR title is what counts.
+(the recommended setup), **the PR title is the commit message**, so the PR title is what counts. The PR
+description becomes the commit body: put details there, and a `BREAKING CHANGE:` footer if there is one.
 
 ```
 <type>(<optional scope>)<optional !>: <description>
@@ -40,7 +41,8 @@ chore(deps): bump vitest to 5.1.0
 refactor!: rename `parse()` to `parseCommit()`
 ```
 
-A breaking change in the footer (for a longer explanation):
+A breaking change in the footer (for a longer explanation). In a PR, put the footer at the end of the PR
+description; the release preview reads it too:
 
 ```text
 feat: support multiple config files
@@ -74,4 +76,5 @@ The ones people trip over:
   `git commit --amend`. (`git commit --no-verify` skips the hook, but the PR title still gets checked.)
 - **PR title check failed**: edit the PR title on GitHub. CI re-runs on its own and the release preview
   comment updates.
-- **Squash merge**: GitHub pre-fills the commit message from the PR title. Leave it as is.
+- **Squash merge**: GitHub pre-fills the commit title from the PR title and the body from the description.
+  Check that the title box shows the PR title before confirming, then leave it as is.

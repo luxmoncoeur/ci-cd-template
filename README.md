@@ -117,6 +117,7 @@ re-runs the title check. Release inputs, all optional:
 | `changelog-file` | `CHANGELOG.md` | Changelog to write. |
 | `bump-package-json` | `true` | Write the version into `package.json` (turn off if there isn't one). |
 | `squash-merge` | `true` | Dry-run: predict from the PR title (squash merge). With `false`, the PR's own commits are used and the title isn't checked. |
+| `squash-body` | `true` | Dry-run: also use the PR description as the commit body, so a `BREAKING CHANGE:` footer in it counts. Matches the "Pull request title and description" merge setting; set `false` if you squash with the title only. |
 | `comment` | `true` | Dry-run: post or update one preview comment on the PR. |
 
 The secret `deploy-key` is optional; see [Protecting `main`](#protecting-main). The workflow's outputs
@@ -177,8 +178,11 @@ The first release is `1.0.0`. The full cheat sheet is in
 
 **1. Merge settings** (Settings → General → Pull Requests):
 
-- Tick **Allow squash merging**, and set **Default commit message** to **Pull request title**.
-- Optionally, turn off merge commits and rebase merging so that every PR lands as one titled commit.
+- Tick **Allow squash merging**, and set **Default commit message** to **Pull request title and
+  description**. The title decides the version; the description becomes the commit body, so the history
+  keeps the details (and a `BREAKING CHANGE:` line in it makes a major release).
+- Turn off merge commits and rebase merging, so that every PR lands as one titled commit. With them on,
+  switching the merge button to squash can keep a "Merge pull request #N…" title, which releases nothing.
 
 **2. Protecting `main`.** Create a ruleset (Settings → Rules → Rulesets → New branch ruleset) that
 targets the default branch, with these rules:
