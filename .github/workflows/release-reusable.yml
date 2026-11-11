@@ -176,13 +176,18 @@ jobs:
         if: inputs.dry-run && inputs.squash-merge && env.IS_PR == 'true'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          # Actions sets CI=true, which makes commitlint print colors. The escape codes would show up as
+          # `^[[31m` junk in the PR comment, so turn them off.
+          NO_COLOR: "1"
         run: |
           set +e
           printf '%s\n' "$PR_TITLE" \
             | node "$SEMREL_DIR/node_modules/@commitlint/cli/cli.js" \
-                --cwd "$SEMREL_DIR" --extends @commitlint/config-conventional > "$RUNNER_TEMP/commitlint.txt" 2>&1
+                --cwd "$SEMREL_DIR" --extends @commitlint/config-conventional > "$RUNNER_TEMP/commitlint.raw" 2>&1
           status=$?
           set -e
+          # Belt and braces: strip any escape codes that got through anyway.
+          sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/commitlint.raw" > "$RUNNER_TEMP/commitlint.txt"
           cat "$RUNNER_TEMP/commitlint.txt"
           if [ $status -ne 0 ]; then
             echo "::error title=PR title is not a Conventional Commit::\"$PR_TITLE\". Use e.g. \"feat: add search\" or \"fix(api): handle empty input\". See docs/conventional-commits.md."
