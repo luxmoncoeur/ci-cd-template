@@ -73,6 +73,13 @@ on:
           PR's individual commits, as a merge commit or rebase would keep them.
         type: boolean
         default: true
+      squash-body:
+        description: >-
+          dry-run with squash-merge only. true: the PR description is the squash commit's body (repo setting
+          "Default commit message: Pull request title and description"), so a `BREAKING CHANGE:` footer in it
+          counts. Set false if your repo squashes with the title only.
+        type: boolean
+        default: true
       comment:
         description: dry-run only. Post (and keep updating) one comment on the PR with the prediction.
         type: boolean
@@ -199,11 +206,15 @@ jobs:
       # The checkout is GitHub's test merge (refs/pull/N/merge): parent 1 is the base branch tip, and its
       # tree is the merged result. A squash merge is that tree on top of the base, with the PR title as
       # the message, which is what `git commit-tree` makes below. No merge is re-run, so nothing can conflict.
+      # With squash-body, the PR description becomes the commit body, as GitHub does with "Pull request title
+      # and description". That's where a `BREAKING CHANGE:` footer can turn a feat into a major release.
       - name: Simulate the merge
         if: inputs.dry-run && env.IS_PR == 'true' && steps.title.outcome != 'failure'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
           SQUASH: ${{ inputs.squash-merge }}
+          SQUASH_BODY: ${{ inputs.squash-body }}
           BRANCH: ${{ github.event.repository.default_branch }}
           GIT_AUTHOR_NAME: github-actions[bot]
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
@@ -211,8 +222,17 @@ jobs:
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
           if [ "$SQUASH" = "true" ]; then
-            commit=$(git commit-tree "HEAD^{tree}" -p HEAD^1 -m "$PR_TITLE")
-            echo "Simulated squash merge: \"$PR_TITLE\""
+            # PR descriptions come with Windows line endings (\r\n). Strip the \r so the commit parser sees
+            # clean lines; otherwise a `BREAKING CHANGE:` footer may not be recognised.
+            body=""
+            [ "$SQUASH_BODY" = "true" ] && body=$(printf '%s' "$PR_BODY" | tr -d '\r')
+            if [ -n "$body" ]; then
+              commit=$(git commit-tree "HEAD^{tree}" -p HEAD^1 -m "$PR_TITLE" -m "$body")
+              echo "Simulated squash merge: \"$PR_TITLE\" with the PR description as its body"
+            else
+              commit=$(git commit-tree "HEAD^{tree}" -p HEAD^1 -m "$PR_TITLE")
+              echo "Simulated squash merge: \"$PR_TITLE\""
+            fi
           else
             commit=$(git rev-parse HEAD)
             echo "Using GitHub's merge commit; the PR's own commits will be analysed."
@@ -332,6 +352,7 @@ jobs:
           TYPE: ${{ steps.semrel.outputs.type }}
           LAST: ${{ steps.semrel.outputs.last }}
           SQUASH: ${{ inputs.squash-merge }}
+          SQUASH_BODY: ${{ inputs.squash-body }}
         run: |
           body="$RUNNER_TEMP/report.md"
           {
@@ -374,7 +395,11 @@ jobs:
             fi
             if [ "$DRY_RUN" = "true" ] && [ "$SQUASH" = "true" ] && [ -n "$PR_TITLE" ] && [ -n "$RELEASED" ]; then
               echo
-              echo "<sub>Predicted from the PR title, as a squash merge would commit it.</sub>"
+              if [ "$SQUASH_BODY" = "true" ]; then
+                echo "<sub>Predicted from the PR title and description, as a squash merge would commit them.</sub>"
+              else
+                echo "<sub>Predicted from the PR title, as a squash merge would commit it.</sub>"
+              fi
             fi
           } > "$body"
           cat "$body" >> "$GITHUB_STEP_SUMMARY"
