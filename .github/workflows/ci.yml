@@ -84,9 +84,17 @@ jobs:
   # After CI passed on main: semantic-release decides whether the merged commits call for a release
   # (feat → minor, fix/perf → patch, `!`/BREAKING CHANGE → major) and, if so, makes it. Its own commit
   # (`chore(release): x.y.z [skip ci]`) doesn't start CI again.
+  #
+  # The `if:` checks `needs.ci.result` itself instead of relying on the implicit success(). That implicit
+  # check looks at every job upstream, not just `ci`, and release-preview is always skipped on pushes, so
+  # it would skip this job too. `ci` has already judged the upstream results, so its result is the one
+  # that counts. `!cancelled()` still stops it when the run is cancelled.
   release:
     needs: [ci]
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >-
+      !cancelled() && needs.ci.result == 'success'
+      && github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: write # push the release commit and tag, create the GitHub Release
     # One release at a time, never cancelled midway. If two merges land close together, the second run
