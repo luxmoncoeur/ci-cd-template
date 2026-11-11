@@ -1,0 +1,396 @@
+name: Release (reusable)
+
+# Automated versioning with semantic-release, driven by Conventional Commits. Two modes:
+#
+#   release (default): on the default branch, after CI passed. Reads the commits since the last tag, works out
+#     the next version, updates CHANGELOG.md and the package.json version, commits that back as
+#     `chore(release): x.y.z [skip ci]`, tags it vX.Y.Z and creates a GitHub Release with notes.
+#     Nothing is published to npm.
+#
+#   dry-run: on pull requests. Checks that the PR title is a Conventional Commit (squash merges use it as the
+#     commit message), then predicts the release this PR would trigger once merged: the job summary and a
+#     single, kept-up-to-date PR comment say "this PR would release vX.Y.Z" (or "no release").
+#
+# Call it like this (permissions go on the CALLING job; see "Permissions" below):
+#
+#   release:
+#     needs: ci
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+#     permissions:
+#       contents: write
+#     uses: luxmoncoeur/ci-cd-template/.github/workflows/release-reusable.yml@v1.0.0 # a release tag or commit SHA
+#     secrets:
+#       deploy-key: ${{ secrets.RELEASE_DEPLOY_KEY }} # optional
+#
+#   release-preview:
+#     if: github.event_name == 'pull_request'
+#     permissions:
+#       contents: read
+#       pull-requests: write
+#     uses: luxmoncoeur/ci-cd-template/.github/workflows/release-reusable.yml@v1.0.0 # a release tag or commit SHA
+#     with:
+#       dry-run: true
+#
+# Configuration: with no semantic-release config in the repo (.releaserc*, release.config.*, or "release" in
+# package.json) the defaults built below are used. A repo config, if present, replaces them entirely.
+#
+# Design notes:
+# - semantic-release and its plugins are installed into $RUNNER_TEMP, pinned to exact versions, not into the
+#   repo. Callers don't need any of it in their package.json, and the template controls the versions.
+#   (Plugins and presets resolve from semantic-release's own install, so this works from any repo.)
+# - Permissions: this workflow sets none and inherits the calling job's token. A called workflow that asks
+#   for more than its caller granted fails to start, so declaring "the most either mode needs" here would
+#   break every caller. Release mode needs `contents: write`; dry-run needs `contents: read` and, for the PR
+#   comment, `pull-requests: write`.
+# - No `concurrency:` here (the caller owns it). Releases should be serialized by the calling job.
+# - Pushing to a protected branch: GITHUB_TOKEN can't bypass rules such as "require a pull request" or
+#   "require status checks", so the release commit would be rejected. Pass the optional `deploy-key` secret
+#   (an SSH deploy key with write access, added to the ruleset's bypass list) and the push goes over SSH
+#   instead. Without the secret, GITHUB_TOKEN is used, which works on an unprotected branch.
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Predict the release instead of making it (for pull requests). Also checks the PR title.
+        type: boolean
+        default: false
+      node-version:
+        description: Node.js version to run semantic-release on. semantic-release 25 and its plugins need 22.22.2+ or 24.15+.
+        type: string
+        default: "22"
+      changelog-file:
+        description: Changelog file to create and update (default config only).
+        type: string
+        default: CHANGELOG.md
+      bump-package-json:
+        description: Write the new version into package.json (default config only). Turn off for repos without one.
+        type: boolean
+        default: true
+      squash-merge:
+        description: >-
+          dry-run only. true: predict from the PR title, as a squash merge would commit it. false: predict from the
+          PR's individual commits, as a merge commit or rebase would keep them.
+        type: boolean
+        default: true
+      comment:
+        description: dry-run only. Post (and keep updating) one comment on the PR with the prediction.
+        type: boolean
+        default: true
+    secrets:
+      deploy-key:
+        description: Optional SSH deploy key with write access, for pushing the release commit past branch protection.
+        required: false
+    outputs:
+      released:
+        description: '"true" if a release was made (or, in dry-run mode, would be made).'
+        value: ${{ jobs.release.outputs.released }}
+      version:
+        description: The new version (e.g. 1.4.0), empty if none.
+        value: ${{ jobs.release.outputs.version }}
+      tag:
+        description: The new git tag (e.g. v1.4.0), empty if none.
+        value: ${{ jobs.release.outputs.tag }}
+      type:
+        description: The bump (major, minor or patch), empty if none.
+        value: ${{ jobs.release.outputs.type }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.semrel.outputs.released }}
+      version: ${{ steps.semrel.outputs.version }}
+      tag: ${{ steps.semrel.outputs.tag }}
+      type: ${{ steps.semrel.outputs.type }}
+    env:
+      # Exact versions, checked on npm when this template was written. Bump them together, deliberately.
+      # The conventionalcommits preset stays on 9.x: 10.x needs conventional-changelog-writer 9, while
+      # commit-analyzer 13 and release-notes-generator 14 still ship writer 8 (10.x fails at generateNotes).
+      SEMREL_PACKAGES: >-
+        semantic-release@25.0.9
+        @semantic-release/commit-analyzer@13.0.1
+        @semantic-release/release-notes-generator@14.1.1
+        @semantic-release/changelog@7.0.0
+        @semantic-release/npm@13.2.0
+        @semantic-release/git@11.0.1
+        @semantic-release/github@12.0.10
+        conventional-changelog-conventionalcommits@9.3.1
+        @commitlint/cli@21.2.4
+        @commitlint/config-conventional@21.2.4
+      IS_PR: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+    steps:
+      - name: Choose mode
+        id: mode
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
+          DEPLOY_KEY: ${{ secrets.deploy-key }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Mode: dry-run (nothing is committed, tagged or released)"
+            # The checkout keeps its read-only token so semantic-release can read tags from private repos too.
+            echo "persist=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$DEPLOY_KEY" ]; then
+            echo "Mode: release, pushing over SSH with the deploy key"
+            echo "ssh=true" >> "$GITHUB_OUTPUT"
+            # actions/checkout only configures the SSH key for later git commands when credentials persist.
+            echo "persist=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Mode: release, pushing with GITHUB_TOKEN (add a deploy-key if the branch is protected)"
+            # semantic-release puts the token into the push URL itself, so the checkout doesn't keep it.
+            echo "persist=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and all tags: semantic-release needs the last release tag and every commit since.
+          fetch-depth: 0
+          # Empty unless the deploy-key secret was passed, in which case checkout sets up SSH with it.
+          ssh-key: ${{ secrets.deploy-key }}
+          persist-credentials: ${{ steps.mode.outputs.persist }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # --ignore-scripts: none of these packages need install scripts, so none get to run.
+      - name: Install semantic-release (pinned, outside the repo)
+        run: |
+          # Later steps find the install through SEMREL_DIR.
+          SEMREL_DIR="$RUNNER_TEMP/semrel"
+          echo "SEMREL_DIR=$SEMREL_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$SEMREL_DIR"
+          cd "$SEMREL_DIR"
+          echo '{ "private": true }' > package.json
+          # Word splitting is intended: SEMREL_PACKAGES is a space-separated list.
+          # shellcheck disable=SC2086
+          npm install --no-audit --no-fund --ignore-scripts --loglevel=error $SEMREL_PACKAGES
+
+      # ── dry-run on a PR: check the title ─────────────────────────────────────────────────────────────────
+      # Only with squash-merge: then the title becomes the commit on main. (With merge commits or rebase the
+      # PR's own commits land instead, and the local commit-msg hook is what checks those.)
+      # Uses the standard @commitlint/config-conventional rules (the same ones the local commit-msg hook
+      # extends), run from the install dir so nothing from the repo needs installing.
+      - name: Check PR title is a Conventional Commit
+        id: title
+        if: inputs.dry-run && inputs.squash-merge && env.IS_PR == 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set +e
+          printf '%s\n' "$PR_TITLE" \
+            | node "$SEMREL_DIR/node_modules/@commitlint/cli/cli.js" \
+                --cwd "$SEMREL_DIR" --extends @commitlint/config-conventional > "$RUNNER_TEMP/commitlint.txt" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/commitlint.txt"
+          if [ $status -ne 0 ]; then
+            echo "::error title=PR title is not a Conventional Commit::\"$PR_TITLE\". Use e.g. \"feat: add search\" or \"fix(api): handle empty input\". See docs/conventional-commits.md."
+            exit 1
+          fi
+
+      # Builds the commit main would get from merging this PR, on a local branch named after the default
+      # branch, so semantic-release can analyse it exactly as it would after the merge.
+      # The checkout is GitHub's test merge (refs/pull/N/merge): parent 1 is the base branch tip, and its
+      # tree is the merged result. A squash merge is that tree on top of the base, with the PR title as
+      # the message, which is what `git commit-tree` makes below. No merge is re-run, so nothing can conflict.
+      - name: Simulate the merge
+        if: inputs.dry-run && env.IS_PR == 'true' && steps.title.outcome != 'failure'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          SQUASH: ${{ inputs.squash-merge }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          if [ "$SQUASH" = "true" ]; then
+            commit=$(git commit-tree "HEAD^{tree}" -p HEAD^1 -m "$PR_TITLE")
+            echo "Simulated squash merge: \"$PR_TITLE\""
+          else
+            commit=$(git rev-parse HEAD)
+            echo "Using GitHub's merge commit; the PR's own commits will be analysed."
+          fi
+          git checkout -q -B "$BRANCH" "$commit"
+
+      # ── semantic-release itself (both modes) ─────────────────────────────────────────────────────────────
+      # Run through its JavaScript API (not the CLI) to get the result as data for the step outputs and the
+      # PR comment, instead of scraping log lines.
+      - name: Run semantic-release
+        id: semrel
+        if: ${{ !inputs.dry-run || env.IS_PR != 'true' || steps.title.outcome != 'failure' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          USE_SSH: ${{ steps.mode.outputs.ssh }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          CHANGELOG_FILE: ${{ inputs.changelog-file }}
+          BUMP_PACKAGE_JSON: ${{ inputs.bump-package-json }}
+          # Release commits are attributed to the Actions bot rather than semantic-release's default identity.
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          cat > "$SEMREL_DIR/run.mjs" <<'EOF'
+          import { appendFileSync } from "node:fs";
+          import { execFileSync } from "node:child_process";
+          import { cosmiconfig } from "cosmiconfig";
+          import semanticRelease from "semantic-release";
+
+          const env = { ...process.env };
+          const dryRun = env.DRY_RUN === "true";
+          const httpsUrl = `https://github.com/${env.REPOSITORY}.git`;
+          const ANALYSIS = ["@semantic-release/commit-analyzer", "@semantic-release/release-notes-generator"];
+          const name = (plugin) => (Array.isArray(plugin) ? plugin[0] : plugin);
+
+          // The default config, used only when the repo has none of its own.
+          const preset = { preset: "conventionalcommits" };
+          const defaults = {
+            branches: [env.BRANCH],
+            tagFormat: "v${version}",
+            plugins: [
+              ["@semantic-release/commit-analyzer", preset],
+              ["@semantic-release/release-notes-generator", preset],
+              ["@semantic-release/changelog", { changelogFile: env.CHANGELOG_FILE, changelogTitle: "# Changelog" }],
+              // Only to write the new version into package.json: never publishes.
+              ...(env.BUMP_PACKAGE_JSON === "true" ? [["@semantic-release/npm", { npmPublish: false }]] : []),
+              ["@semantic-release/git", {
+                assets: [env.CHANGELOG_FILE, ...(env.BUMP_PACKAGE_JSON === "true" ? ["package.json", "package-lock.json"] : [])],
+                // [skip ci]: GitHub doesn't start push/PR workflows for this commit (it was just tested).
+                message: "chore(release): ${nextRelease.version} [skip ci]",
+              }],
+              // Creates the GitHub Release. Comments and labels on released PRs/issues are off so the job
+              // needs only `contents: write`. To turn them on, set them in a repo config and grant
+              // `issues: write` + `pull-requests: write`.
+              ["@semantic-release/github", { successCommentCondition: false, failCommentCondition: false, releasedLabels: false }],
+            ],
+          };
+
+          const repoConfig = (await cosmiconfig("release").search(process.cwd()))?.config;
+          const config = repoConfig ? {} : defaults;
+          console.log(repoConfig ? "Using the repo's semantic-release config." : "Using the template's default config.");
+
+          const options = { ...config, repositoryUrl: env.USE_SSH === "true" ? `git@github.com:${env.REPOSITORY}.git` : httpsUrl };
+
+          if (dryRun) {
+            options.dryRun = true;
+            // Only the plugins that analyse commits and write notes, so a read-only token is enough
+            // (keeping each plugin's options from the repo config or the defaults).
+            const plugins = (repoConfig?.plugins ?? defaults.plugins).filter((p) => ANALYSIS.includes(name(p)));
+            options.plugins = plugins.length ? plugins : defaults.plugins.filter((p) => ANALYSIS.includes(name(p)));
+            // Run as if this were a push to the default branch. Otherwise semantic-release sees a PR and stops.
+            Object.assign(env, { GITHUB_EVENT_NAME: "push", GITHUB_REF: `refs/heads/${env.BRANCH}` });
+            // semantic-release first checks it can push (`git push --dry-run`), which a PR's read-only token
+            // can't. Redirect pushes (only pushes; fetches still read the real repo and its tags) to an empty
+            // local repository, and drop the token so the URL isn't rewritten past that redirect.
+            const sink = `${env.RUNNER_TEMP}/push-sink.git`;
+            execFileSync("git", ["init", "-q", "--bare", sink]);
+            execFileSync("git", ["config", `url.${sink}.pushInsteadOf`, httpsUrl]);
+            delete env.GITHUB_TOKEN;
+            delete env.GH_TOKEN;
+          }
+
+          const result = await semanticRelease(options, { cwd: process.cwd(), env });
+
+          const next = result ? result.nextRelease : undefined;
+          const out = (key, value) => appendFileSync(env.GITHUB_OUTPUT, `${key}=${value ?? ""}\n`);
+          out("released", next ? "true" : "false");
+          out("version", next?.version);
+          out("tag", next?.gitTag);
+          out("type", next?.type);
+          out("last", result ? result.lastRelease?.version : "");
+          // Notes can span lines, so they go to a file rather than an output. In dry-run mode, drop the
+          // " ([abc1234](…/commit/…))" links to the simulated merge commit: that SHA never exists on GitHub.
+          let notes = next?.notes ?? "";
+          if (dryRun) {
+            const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+            notes = notes.replace(new RegExp(String.raw` \(\[[0-9a-f]{7,40}\]\([^)]*/commit/${head}\)\)`, "g"), "");
+          }
+          appendFileSync(`${env.RUNNER_TEMP}/release-notes.md`, notes);
+          EOF
+          cd "$GITHUB_WORKSPACE"
+          node "$SEMREL_DIR/run.mjs"
+
+      # ── report ───────────────────────────────────────────────────────────────────────────────────────────
+      - name: Summary
+        id: report
+        if: ${{ !cancelled() }}
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
+          TITLE_OUTCOME: ${{ steps.title.outcome }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          RELEASED: ${{ steps.semrel.outputs.released }}
+          VERSION: ${{ steps.semrel.outputs.version }}
+          TYPE: ${{ steps.semrel.outputs.type }}
+          LAST: ${{ steps.semrel.outputs.last }}
+          SQUASH: ${{ inputs.squash-merge }}
+        run: |
+          body="$RUNNER_TEMP/report.md"
+          {
+            echo "<!-- ci-cd-template:release-preview -->"
+            if [ "$DRY_RUN" = "true" ] && [ "$TITLE_OUTCOME" = "failure" ]; then
+              echo "### ❌ PR title isn't a Conventional Commit"
+              echo
+              echo "Squash merges use the PR title as the commit message, and the release is worked out from it."
+              echo "Rename the PR to something like \`feat: add search\` or \`fix(api): handle empty input\`."
+              echo
+              echo '```'
+              cat "$RUNNER_TEMP/commitlint.txt"
+              echo '```'
+            elif [ "$RELEASED" = "true" ]; then
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "### 📦 This PR would release **v$VERSION** ($TYPE)"
+              else
+                echo "### 🚀 Released **v$VERSION** ($TYPE)"
+              fi
+              echo
+              echo "Previous release: ${LAST:+v}${LAST:-none (this is the first)}"
+              echo
+              echo "<details><summary>Release notes</summary>"
+              echo
+              cat "$RUNNER_TEMP/release-notes.md"
+              echo
+              echo "</details>"
+            elif [ -n "$RELEASED" ]; then
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "### This PR wouldn't trigger a release"
+                echo
+                echo "Only \`feat\`, \`fix\`, \`perf\` and breaking changes (\`!\` or \`BREAKING CHANGE:\`) release. That's fine for docs, chores, CI and refactors."
+              else
+                echo "### No release"
+                echo
+                echo "No commits since the last release call for one (or main moved on and a newer run will release)."
+              fi
+            else
+              echo "### Release step didn't run to completion. See the job log."
+            fi
+            if [ "$DRY_RUN" = "true" ] && [ "$SQUASH" = "true" ] && [ -n "$PR_TITLE" ] && [ -n "$RELEASED" ]; then
+              echo
+              echo "<sub>Predicted from the PR title, as a squash merge would commit it.</sub>"
+            fi
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+      # One comment per PR, edited in place on every run (found by the hidden marker on its first line).
+      # PRs from forks get a read-only token, so commenting fails there. The summary above still has it all.
+      - name: Comment on the PR
+        if: ${{ !cancelled() && inputs.dry-run && inputs.comment && env.IS_PR == 'true' && steps.report.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          marker="<!-- ci-cd-template:release-preview -->"
+          id=$(gh api "repos/$REPOSITORY/issues/$PR/comments" --paginate \
+                 --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | head -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPOSITORY/issues/comments/$id" -F "body=@$RUNNER_TEMP/report.md" > /dev/null
+            echo "Updated comment $id"
+          else
+            gh api -X POST "repos/$REPOSITORY/issues/$PR/comments" -F "body=@$RUNNER_TEMP/report.md" > /dev/null
+            echo "Created a comment"
+          fi

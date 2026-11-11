@@ -1,0 +1,223 @@
+name: CI (reusable)
+
+# A reusable CI pipeline for Node projects: install → lint · typecheck · test · build.
+# Call it from any repo (public repos run Actions for free; GITHUB_TOKEN only, no secrets):
+#
+#   jobs:
+#     checks:
+#       uses: luxmoncoeur/ci-cd-template/.github/workflows/ci-reusable.yml@v1.0.0 # a release tag or commit SHA
+#       with:
+#         run-build: false
+#
+# What the calling repo needs:
+# - package.json scripts named `lint`, `typecheck`, `test` and `build` for the steps it turns on.
+# - A lockfile for the chosen package manager (pnpm-lock.yaml, package-lock.json or yarn.lock).
+# - pnpm: a "packageManager": "pnpm@x.y.z" field, which pnpm/action-setup reads to pick the version.
+# - yarn: Yarn 2+ (Berry) via corepack, with "packageManager": "yarn@x.y.z".
+# - Optional: Vitest/Jest/c8 writing coverage/coverage-summary.json (the `json-summary` reporter)
+#   for a coverage table in the test job's summary.
+#
+# Design notes:
+# - Everything this workflow does is inline. A reusable workflow resolves `./` paths (local actions,
+#   scripts) against the CALLER's checkout, so it can't lean on helper files in this repo.
+# - No `concurrency:` here: the caller owns that. A group set inside a called workflow can collide with
+#   the caller's group and cancel or deadlock the run.
+# - The caller can only narrow the token, never widen it, so each job asks for `contents: read` only.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version for actions/setup-node (e.g. "22", "24", "lts/*").
+        type: string
+        default: "22"
+      package-manager:
+        description: "pnpm, npm or yarn (Yarn 2+ via corepack)."
+        type: string
+        default: pnpm
+      run-lint:
+        description: Run the `lint` script.
+        type: boolean
+        default: true
+      run-typecheck:
+        description: Run the `typecheck` script.
+        type: boolean
+        default: true
+      run-test:
+        description: Run the `test` script and summarize coverage when a json-summary report exists.
+        type: boolean
+        default: true
+      run-build:
+        description: Run the `build` script.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Installs once and warms the package-manager cache. Jobs can't share a filesystem, so the four
+  # check jobs below still run their own install, but against a warm cache (seconds, not minutes).
+  # It also fails fast on a broken lockfile or a bad input before four runners spin up.
+  install:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate inputs
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: |
+          case "$PM" in
+            pnpm|npm|yarn) echo "Package manager: $PM" ;;
+            *) echo "::error title=Invalid input::package-manager must be pnpm, npm or yarn (got '$PM')"; exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes, so don't leave the token in .git/config.
+          persist-credentials: false
+      # pnpm must be on PATH before setup-node, which asks it where its store lives for caching.
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      # Yarn Berry comes from corepack (bundled with Node up to 24).
+      - if: inputs.package-manager == 'yarn'
+        run: corepack enable
+      # cache: restores the package-manager store keyed on the lockfile, and saves it at the end
+      # of this job on a miss. The check jobs only restore.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      # `&install` is a YAML anchor: the check jobs reuse this exact script as `*install`, so the
+      # install command lives in one place.
+      - name: Install dependencies (frozen lockfile)
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: &install |
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            npm)  npm ci ;;
+            yarn) yarn install --immutable ;;
+          esac
+
+  # The four checks don't depend on each other, so they run in parallel once install has passed.
+  # Their setup steps repeat on purpose: a reusable workflow can't call a composite action from its own
+  # repo by a relative path (see the notes at the top).
+  lint:
+    needs: install
+    if: inputs.run-lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - if: inputs.package-manager == 'yarn'
+        run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies (from cache)
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: *install
+      - run: ${{ inputs.package-manager }} run lint
+
+  typecheck:
+    needs: install
+    if: inputs.run-typecheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - if: inputs.package-manager == 'yarn'
+        run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies (from cache)
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: *install
+      - run: ${{ inputs.package-manager }} run typecheck
+
+  test:
+    needs: install
+    if: inputs.run-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - if: inputs.package-manager == 'yarn'
+        run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies (from cache)
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: *install
+      - run: ${{ inputs.package-manager }} run test
+      # Runs even when tests fail (a coverage threshold miss fails the test step, and that's exactly
+      # when the numbers are most useful). Reads the standard istanbul json-summary format, which
+      # Vitest, Jest and c8 all write, so it isn't tied to one test runner.
+      - name: Coverage summary
+        if: ${{ !cancelled() }}
+        run: |
+          node --input-type=module -e '
+            import { appendFileSync, existsSync, readFileSync } from "node:fs";
+            const file = "coverage/coverage-summary.json";
+            const out = (text) => appendFileSync(process.env.GITHUB_STEP_SUMMARY, text + "\n");
+            out("### Coverage");
+            if (!existsSync(file)) {
+              out("No <code>" + file + "</code> found. Add the <code>json-summary</code> coverage reporter to see coverage here.");
+              process.exit(0);
+            }
+            const { total } = JSON.parse(readFileSync(file, "utf8"));
+            out("| Metric | Coverage | Covered / total |");
+            out("| --- | ---: | ---: |");
+            for (const key of ["lines", "statements", "functions", "branches"]) {
+              const m = total[key];
+              out("| " + key + " | " + m.pct + "% | " + m.covered + " / " + m.total + " |");
+            }
+          '
+
+  build:
+    needs: install
+    if: inputs.run-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - if: inputs.package-manager == 'yarn'
+        run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies (from cache)
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: *install
+      - run: ${{ inputs.package-manager }} run build

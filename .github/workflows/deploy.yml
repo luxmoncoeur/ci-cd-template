@@ -1,0 +1,113 @@
+name: Deploy
+
+# Optional Vercel production deploy, run after CI passes on main.
+#
+# Off by default. It turns on when all three repo secrets exist (Settings → Secrets and variables →
+# Actions):
+#   VERCEL_TOKEN       from vercel.com/account/tokens
+#   VERCEL_ORG_ID      } both in .vercel/project.json after a local `vercel link`
+#   VERCEL_PROJECT_ID  }
+# Without them the run still succeeds: it skips the deploy and leaves a notice saying why. Vercel's
+# Hobby plan is free.
+#
+# Already using Vercel's Git integration (auto-deploys on push)? Then you don't need this workflow.
+# Use one or the other, or both deploy every commit. This one only deploys commits that passed CI.
+#
+# Why workflow_run and not a job in ci.yml: ci.yml runs on pull requests with a read-only token and no
+# secrets, and should stay that way. workflow_run starts a separate run that can read secrets, and only
+# after CI has finished. Note: GitHub only triggers workflow_run from the copy of this file on the
+# default branch, so changes to it take effect once merged to main.
+
+on:
+  workflow_run:
+    workflows: [CI] # matches `name:` in ci.yml
+    types: [completed]
+    branches: [main]
+
+# Deploys queue instead of cancelling each other. A half-finished production deploy is worse than a
+# late one. If several merges land quickly, GitHub keeps only the newest pending run, so main's latest
+# commit is what ends up live.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+# Nothing by default. Each job asks for what it needs.
+permissions: {}
+
+jobs:
+  # Decides whether to deploy. A job can't test secrets in `if:` directly, so this one reads them
+  # into env and exposes a plain true/false output. Keeping it separate from `deploy` means a repo
+  # without Vercel never creates an empty "production" deployment entry.
+  preflight:
+    # Only CI runs that passed and came from a push to main. A workflow_dispatch run of CI on main
+    # doesn't deploy either: re-run the last CI from main's push if you need to redeploy.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          missing=()
+          [ -n "$VERCEL_TOKEN" ]      || missing+=(VERCEL_TOKEN)
+          [ -n "$VERCEL_ORG_ID" ]     || missing+=(VERCEL_ORG_ID)
+          [ -n "$VERCEL_PROJECT_ID" ] || missing+=(VERCEL_PROJECT_ID)
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          msg="Vercel deploy skipped: missing secret(s) ${missing[*]}. Add them under Settings → Secrets and variables → Actions to enable deploys."
+          echo "::notice title=Deploy skipped::$msg"
+          echo "### Deploy skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # A GitHub Environment (free on public repos) records each deploy with its URL on the repo page. You
+    # can also add required reviewers or a wait timer to it later. GitHub creates it on first use.
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      # Pinned like the actions: a new CLI major can't change deploy behaviour without a commit here.
+      VERCEL_CLI: vercel@58.4.4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Deploy the exact commit CI tested, not whatever main points to by now.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      # `vercel build` runs the project's install and build commands locally, so it needs pnpm and Node.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      # Build on the runner and upload the result (--prebuilt) rather than having Vercel build again:
+      # what ships is what this workflow built from the CI-tested commit.
+      - name: Pull Vercel project settings
+        run: npx --yes "$VERCEL_CLI" pull --yes --environment=production --token="$VERCEL_TOKEN"
+      - name: Build
+        run: npx --yes "$VERCEL_CLI" build --prod --token="$VERCEL_TOKEN"
+      - name: Deploy to production
+        id: deploy
+        run: |
+          url=$(npx --yes "$VERCEL_CLI" deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "### Deployed to production" >> "$GITHUB_STEP_SUMMARY"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"

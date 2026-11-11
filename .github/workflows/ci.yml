@@ -1,0 +1,100 @@
+name: CI
+
+# This repo's own pipeline. It calls the reusable workflows exactly the way any other repo would, so the
+# template is always tested by its own example.
+#
+#   pull_request:  checks ─┐
+#                  release-preview (PR title check + "this PR would release vX.Y.Z") ─┴─> ci  (required check)
+#   push to main:  checks ──> ci ──> release (semantic-release: version, CHANGELOG, tag, GitHub Release)
+#
+# Deploy (deploy.yml) waits for this workflow by its name, "CI". Rename both together.
+#
+# No `paths-ignore`: if a required check's workflow is skipped by a path filter, GitHub leaves the check
+# "pending" forever and the PR can't merge. CI is fast enough to run on every change.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # The defaults plus `edited`, so renaming a PR re-runs the title check and the release preview.
+    # The whole pipeline re-runs on an edit (description changes too): with one required check, a
+    # partial run could report green without the tests having finished. Minutes are free on public repos.
+    types: [opened, synchronize, reopened, edited]
+  # Re-run by hand from the Actions tab. On main this also retries a release that failed.
+  workflow_dispatch:
+
+# A new push (or edit) to a PR cancels that PR's older, now outdated run. Every other run gets a unique
+# group (its run_id), so pushes to main never cancel each other: each merge gets a complete result, which
+# deploy and release depend on.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default. Only the two jobs that need more ask for it, below.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    # A local path (not owner/repo@ref) so a PR that edits a reusable workflow tests its own version.
+    uses: ./.github/workflows/ci-reusable.yml
+    with:
+      node-version: "22"
+      package-manager: pnpm
+      run-lint: true
+      run-typecheck: true
+      run-test: true
+      run-build: true
+
+  # PRs only: fails on a non-Conventional PR title (squash merges commit the title), and comments the
+  # release the PR would trigger. Part of the required check, so a bad title blocks the merge.
+  release-preview:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write # the preview comment (PRs from forks get read-only anyway and just skip it)
+    uses: ./.github/workflows/release-reusable.yml
+    with:
+      dry-run: true
+
+  # The one required status check for branch protection. Without it you'd have to list every job
+  # (checks / lint, checks / test, …) as required and update the list whenever a job is added or renamed.
+  # `if: always()` makes it report even when something upstream failed. Otherwise it would be "skipped",
+  # and GitHub treats a skipped required check as passing.
+  ci:
+    needs: [checks, release-preview]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: All checks passed?
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          CHECKS: ${{ needs.checks.result }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # `checks` must actually have passed. Other jobs may be skipped (release-preview on pushes),
+          # but none may have failed or been cancelled.
+          bad=$(echo "$NEEDS" | jq '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")] | length')
+          if [ "$CHECKS" != "success" ] || [ "$bad" != "0" ]; then
+            echo "::error title=CI failed::One or more required jobs did not succeed."
+            exit 1
+          fi
+
+  # After CI passed on main: semantic-release decides whether the merged commits call for a release
+  # (feat → minor, fix/perf → patch, `!`/BREAKING CHANGE → major) and, if so, makes it. Its own commit
+  # (`chore(release): x.y.z [skip ci]`) doesn't start CI again.
+  release:
+    needs: [ci]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write # push the release commit and tag, create the GitHub Release
+    # One release at a time, never cancelled midway. If two merges land close together, the second run
+    # waits; the first finds main has moved on and leaves that release to the second.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    uses: ./.github/workflows/release-reusable.yml
+    secrets:
+      # Optional. Only needed when main is protected (see README → "Protecting main").
+      deploy-key: ${{ secrets.RELEASE_DEPLOY_KEY }}

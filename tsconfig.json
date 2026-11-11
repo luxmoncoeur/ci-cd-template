@@ -1,0 +1,19 @@
+{
+  // Used by `pnpm typecheck` (tsc --noEmit) and editors: covers source, tests and config files.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "outDir": "dist",
+    "noEmit": true
+  },
+  "include": ["src", "*.ts"]
+}
