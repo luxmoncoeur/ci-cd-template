@@ -1,6 +1,6 @@
 {
   "name": "ci-cd-template",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Reusable, free-forever GitHub Actions CI/CD + automated semantic-release template.",
   "type": "module",
